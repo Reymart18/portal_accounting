@@ -8,7 +8,7 @@ export function getSyncMode(): SyncMode {
         return configured;
     }
 
-    return process.env.NODE_ENV === 'production' ? 'push_api' : 'local_dbf';
+    return 'push_api';
 }
 
 export function isLocalDbfMode(): boolean {

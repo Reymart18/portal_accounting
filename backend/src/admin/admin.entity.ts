@@ -1,11 +1,11 @@
 import { Entity, PrimaryGeneratedColumn, Column } from 'typeorm';
 
-@Entity() // marks this class as a table
+@Entity({ name: 'admin' })
 export class Admin {
-    @PrimaryGeneratedColumn() // auto increment primary key
+    @PrimaryGeneratedColumn()
     id?: number;
 
-    @Column({ unique: true }) // username should be unique
+    @Column({ unique: true })
     username?: string;
 
     @Column()

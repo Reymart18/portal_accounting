@@ -1,9 +1,5 @@
 import { Injectable } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
-import { In, MoreThanOrEqual, Repository } from 'typeorm';
-import { FoxproBilling } from '../foxpro/foxpro-billing.entity';
-import { FoxproPayment } from '../foxpro/foxpro-payment.entity';
-import { OnlinePayment } from '../paymongo/online-payment.entity';
+import { DataSource } from 'typeorm';
 
 export interface StatementRow {
     date: string;
@@ -36,33 +32,42 @@ export interface StatementRow {
 @Injectable()
 export class StatementsService {
     constructor(
-        @InjectRepository(FoxproBilling)
-        private billingRepo: Repository<FoxproBilling>,
-        @InjectRepository(FoxproPayment)
-        private paymentRepo: Repository<FoxproPayment>,
-        @InjectRepository(OnlinePayment)
-        private onlinePaymentRepo: Repository<OnlinePayment>,
+        private dataSource: DataSource,
     ) { }
 
     async getStatement(accountId: string): Promise<StatementRow[]> {
-        const paymentCutoff = this.getPaymentsCutoffDate();
-        const [billings, payments, onlinePayments] = await Promise.all([
-            this.billingRepo.find({
-                where: { accountId },
-                order: { dueDate: 'ASC' },
-            }),
-            this.paymentRepo.find({
-                where: {
-                    accountId,
-                    paymentDate: MoreThanOrEqual(paymentCutoff),
-                    isDeletedFromFoxpro: false,
-                },
-                order: { paymentDate: 'ASC' },
-            }),
-            this.onlinePaymentRepo.find({
-                where: { accountId, status: In(['PENDING', 'UNDER_REVIEW']) },
-                order: { paidAt: 'ASC' },
-            }),
+        const [blockCode, lotCode] = accountId.split('-');
+        if (!blockCode || !lotCode) {
+            return [];
+        }
+
+        const members = await this.dataSource.query(
+            'SELECT id FROM members WHERE block_code = ? AND lot_code = ? LIMIT 1',
+            [blockCode, lotCode],
+        );
+        if (members.length === 0) {
+            return [];
+        }
+
+        const memberId = members[0].id;
+        const [billings, payments] = await Promise.all([
+            this.dataSource.query(
+                `SELECT billing_month, rate, amount, created_at, principal, interest,
+                        penalty, previous_principal, previous_interest, previous_penalty
+                 FROM billings
+                 WHERE member_id = ?
+                 ORDER BY billing_month ASC, id ASC`,
+                [memberId],
+            ),
+            this.dataSource.query(
+                `SELECT collection_date, reference_number, amount, remarks, payment_type,
+                        payment_method, net_amount, applied_penalty, applied_interest,
+                        applied_principal
+                 FROM collections
+                 WHERE member_id = ?
+                 ORDER BY collection_date ASC, id ASC`,
+                [memberId],
+            ),
         ]);
 
         const rows: Array<{
@@ -92,77 +97,70 @@ export class StatementsService {
         }> = [];
 
         for (const billing of billings) {
-            if (!billing.dueDate) {
+            if (!billing.billing_month) {
                 continue;
             }
-            const dateFromValue = this.toDate(billing.dateFrom);
-            const dateToValue = this.toDate(billing.dateTo);
-            const billDateValue = this.toDate(billing.billDate);
-            const dueDateValue = this.toDate(billing.dueDate);
+            const monthStart = new Date(`${billing.billing_month}-01T00:00:00.000Z`);
+            const dateFromValue = this.toDate(monthStart);
+            const monthEnd = new Date(Date.UTC(
+                monthStart.getUTCFullYear(),
+                monthStart.getUTCMonth() + 1,
+                0,
+                23,
+                59,
+                59,
+                999,
+            ));
+            const dateToValue = this.toDate(new Date(Date.UTC(
+                monthStart.getUTCFullYear(),
+                monthStart.getUTCMonth() + 1,
+                0,
+                12,
+            )));
+            const billDateValue = this.toDate(billing.created_at);
+            const dueDateValue = this.toDate(monthEnd);
             rows.push({
-                dateValue: new Date(billing.dueDate),
+                dateValue: dueDateValue || monthStart,
                 type: 'billing',
                 dateFromValue,
                 dateToValue,
                 billDateValue,
                 dueDateValue,
-                prinBal: Number(billing.prinBal || 0),
-                intBal: Number(billing.intBal || 0),
-                penBal: Number(billing.penBal || 0),
+                prinBal: Number(billing.previous_principal || 0),
+                intBal: Number(billing.previous_interest || 0),
+                penBal: Number(billing.previous_penalty || 0),
                 previousBalance:
-                    Number(billing.prinBal || 0) +
-                    Number(billing.intBal || 0) +
-                    Number(billing.penBal || 0),
-                prinCurr: Number(billing.prinCurr || 0),
-                intCurr: Number(billing.intCurr || 0),
-                penCurr: Number(billing.penCurr || 0),
-                duesRate: Number(billing.duesRate || 0),
-                amountDue: Number(billing.prinCurr || 0),
-                interest: Number(billing.intCurr || 0),
-                penalty: Number(billing.penCurr || 0),
+                    Number(billing.previous_principal || 0) +
+                    Number(billing.previous_interest || 0) +
+                    Number(billing.previous_penalty || 0),
+                prinCurr: Number(billing.principal || 0),
+                intCurr: Number(billing.interest || 0),
+                penCurr: Number(billing.penalty || 0),
+                duesRate: Number(billing.rate || 0),
+                amountDue: Number(billing.principal || 0),
+                interest: Number(billing.interest || 0),
+                penalty: Number(billing.penalty || 0),
                 amountPaid: 0,
-                description: this.formatBillingDescription(billing) || 'Billing',
+                description: `Billing ${billing.billing_month}`,
             });
         }
 
         for (const payment of payments) {
-            if (!payment.paymentDate) {
+            if (!payment.collection_date) {
                 continue;
             }
             rows.push({
-                dateValue: new Date(payment.paymentDate),
+                dateValue: new Date(payment.collection_date),
                 type: 'payment',
-                referenceNumber: payment.referenceNumber ?? null,
-                paycat: payment.paycat ?? null,
+                referenceNumber: payment.reference_number ?? null,
+                paycat: payment.payment_method ?? payment.payment_type ?? null,
                 amountDue: 0,
                 interest: 0,
                 penalty: 0,
-                amountPaid: Number(payment.amountPaid || 0),
-                description: payment.description || 'Payment',
+                amountPaid: Number(payment.net_amount || payment.amount || 0),
+                description: payment.remarks || payment.payment_method || 'Payment',
                 isOnlinePayment: false,
                 paymentStatus: null,
-            });
-        }
-
-        for (const payment of onlinePayments) {
-            const paymentDate = payment.paidAt || payment.createdAt;
-            if (!paymentDate) {
-                continue;
-            }
-            rows.push({
-                dateValue: new Date(paymentDate),
-                type: 'payment',
-                referenceNumber: 'Online Payment',
-                paycat: 'Membership dues',
-                amountDue: 0,
-                interest: 0,
-                penalty: 0,
-                amountPaid: Number(payment.amount || 0),
-                description: payment.paymongoReference
-                    ? `${payment.status || 'PENDING'} · ${payment.paymongoReference}`
-                    : payment.status || 'PENDING',
-                isOnlinePayment: true,
-                paymentStatus: payment.status,
             });
         }
 
@@ -222,19 +220,6 @@ export class StatementsService {
         return statement;
     }
 
-    private formatBillingDescription(billing: FoxproBilling): string {
-        const fromDate = this.toDate(billing.dateFrom);
-        const toDate = this.toDate(billing.dateTo);
-
-        if (fromDate && toDate) {
-            const from = this.formatDate(fromDate);
-            const to = this.formatDate(toDate);
-            return `Billing ${from} - ${to}`;
-        }
-
-        return 'Billing';
-    }
-
     private toDate(value: Date | string | null | undefined): Date | null {
         if (!value) {
             return null;
@@ -259,15 +244,4 @@ export class StatementsService {
         return `${year}-${month}-${day}`;
     }
 
-    private getPaymentsCutoffDate(): Date {
-        const configured = process.env.FOXPRO_PAYMENTS_CUTOFF_DATE;
-        if (configured) {
-            const parsed = new Date(`${configured}T00:00:00.000Z`);
-            if (!Number.isNaN(parsed.getTime())) {
-                return parsed;
-            }
-        }
-
-        return new Date(Date.UTC(2025, 0, 1));
-    }
 }

@@ -48,9 +48,9 @@ function shouldSynchronizeDatabase(): boolean {
       type: 'mysql',
       host: process.env.DB_HOST || 'localhost',
       port: Number(process.env.DB_PORT || 3306),
-      username: process.env.DB_USER || 'hoa_user',
-      password: process.env.DB_PASS || 'strongpassword',
-      database: process.env.DB_NAME || 'hoa_portal',
+      username: process.env.DB_USER || 'root',
+      password: process.env.DB_PASS || '',
+      database: process.env.DB_NAME || 'portal_accounting',
       entities: [
         Admin,
         AdminActivity,

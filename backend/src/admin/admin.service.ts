@@ -149,8 +149,46 @@ export class AdminService {
     }
 
     async getAllPropertyAccounts() {
-        const accounts = await this.propertyRepo.find();
-        return this.propertyService.attachGoodStandingStatus(accounts);
+        const members = await this.dataSource.query(`
+            SELECT
+                id,
+                CONCAT(block_code, '-', lot_code) AS accountId,
+                block_code AS block,
+                lot_code AS lot,
+                registered_owners AS memberName,
+                sqm_size AS propertySizeSqm,
+                classification,
+                principal,
+                interest,
+                penalty,
+                (principal + interest + penalty) AS balance
+            FROM members
+            ORDER BY CAST(block_code AS UNSIGNED), CAST(lot_code AS UNSIGNED), id
+        `);
+
+        return members.map((member: {
+            id: number;
+            accountId: string;
+            block: string;
+            lot: string;
+            memberName: string | null;
+            propertySizeSqm: number | null;
+            classification: string;
+            principal: number;
+            interest: number;
+            penalty: number;
+            balance: number;
+        }) => ({
+            ...member,
+            neighborhood: '',
+            balance: Number(member.balance || 0),
+            principal: Number(member.principal || 0),
+            interest: Number(member.interest || 0),
+            penalty: Number(member.penalty || 0),
+            goodStandingStatus: Number(member.balance || 0) > 0
+                ? 'Not in Good Standing'
+                : 'In Good Standing',
+        }));
     }
 
     async updatePropertyAccount(

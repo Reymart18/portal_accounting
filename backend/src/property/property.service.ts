@@ -54,7 +54,40 @@ export class PropertyService {
     }
 
     async getByAccountId(accountId: string): Promise<PropertyAccount | null> {
-        return this.propertyRepo.findOne({ where: { accountId } });
+        const [blockCode, lotCode] = accountId.split('-');
+        if (!blockCode || !lotCode) {
+            return null;
+        }
+
+        const members = await this.dataSource.query(
+            `SELECT id, block_code, lot_code, registered_owners, sqm_size, classification,
+                    principal, interest, penalty
+             FROM members
+             WHERE block_code = ? AND lot_code = ?
+             LIMIT 1`,
+            [blockCode, lotCode],
+        );
+        const member = members[0];
+        if (!member) {
+            return null;
+        }
+
+        return {
+            id: Number(member.id),
+            accountId,
+            neighborhood: '',
+            block: String(member.block_code),
+            lot: String(member.lot_code),
+            memberName: member.registered_owners,
+            propertySizeSqm: member.sqm_size,
+            classification: member.classification,
+            balance: Number(member.principal || 0) +
+                Number(member.interest || 0) +
+                Number(member.penalty || 0),
+            principal: Number(member.principal || 0),
+            interest: Number(member.interest || 0),
+            penalty: Number(member.penalty || 0),
+        };
     }
 
     async uploadSoaNumbers(file: Express.Multer.File) {

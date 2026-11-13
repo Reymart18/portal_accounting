@@ -8,10 +8,8 @@ import {
     UseGuards,
 } from '@nestjs/common';
 import type { Request as ExpressRequest } from 'express';
-import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { DataSource } from 'typeorm';
 import { JwtAuthGuard } from '../auth/jwt.guard';
-import { PropertyAccount } from '../property/property.entity';
 import { StatementsService, type StatementRow } from './statements.service';
 
 interface AuthenticatedRequest extends ExpressRequest {
@@ -26,8 +24,7 @@ interface AuthenticatedRequest extends ExpressRequest {
 export class StatementsController {
     constructor(
         private statementsService: StatementsService,
-        @InjectRepository(PropertyAccount)
-        private propertyRepo: Repository<PropertyAccount>,
+        private dataSource: DataSource,
     ) { }
 
     @UseGuards(JwtAuthGuard)
@@ -36,12 +33,16 @@ export class StatementsController {
         @Param('accountId') accountId: string,
         @Request() req: AuthenticatedRequest,
     ): Promise<StatementRow[]> {
-        const account = await this.propertyRepo.findOne({ where: { accountId } });
-        if (!account) {
+        const [blockCode, lotCode] = accountId.split('-');
+        const members = await this.dataSource.query(
+            'SELECT id FROM members WHERE block_code = ? AND lot_code = ? LIMIT 1',
+            [blockCode, lotCode],
+        );
+        if (members.length === 0) {
             throw new BadRequestException('Account not found');
         }
 
-        if (req.user.role === 'homeowner' && account.id !== req.user.id) {
+        if (req.user.role === 'homeowner' && Number(members[0].id) !== req.user.id) {
             throw new ForbiddenException('You can only access your own statement');
         }
 
