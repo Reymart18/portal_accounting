@@ -61,6 +61,7 @@ export class PropertyService {
 
         const members = await this.dataSource.query(
             `SELECT id, block_code, lot_code, registered_owners, sqm_size, classification,
+                    email, cellphone_number, telephone_number,
                     principal, interest, penalty
              FROM members
              WHERE block_code = ? AND lot_code = ?
@@ -81,6 +82,9 @@ export class PropertyService {
             memberName: member.registered_owners,
             propertySizeSqm: member.sqm_size,
             classification: member.classification,
+            gmail: member.email,
+            celno: member.cellphone_number,
+            telno: member.telephone_number,
             balance: Number(member.principal || 0) +
                 Number(member.interest || 0) +
                 Number(member.penalty || 0),

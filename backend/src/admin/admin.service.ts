@@ -158,6 +158,9 @@ export class AdminService {
                 registered_owners AS memberName,
                 sqm_size AS propertySizeSqm,
                 classification,
+                email AS gmail,
+                cellphone_number AS celno,
+                telephone_number AS telno,
                 principal,
                 interest,
                 penalty,
@@ -174,6 +177,9 @@ export class AdminService {
             memberName: string | null;
             propertySizeSqm: number | null;
             classification: string;
+            gmail: string | null;
+            celno: string | null;
+            telno: string | null;
             principal: number;
             interest: number;
             penalty: number;
@@ -586,6 +592,17 @@ export class AdminService {
         return 'https://parkplacevillage.cloud';
     }
 
+    private formatBillingMonthStart(billingMonth: string): string {
+        const [year, month] = billingMonth.split('-').map(Number);
+        return `${month}/1/${year}`;
+    }
+
+    private formatBillingMonthEnd(billingMonth: string): string {
+        const [year, month] = billingMonth.split('-').map(Number);
+        const lastDay = new Date(Date.UTC(year, month, 0)).getUTCDate();
+        return `${month}/${lastDay}/${year}`;
+    }
+
     async getDashboardSummary(): Promise<{
         currentBillingLabel: string;
         unpaidAccountsCount: number;
@@ -594,1210 +611,229 @@ export class AdminService {
         notGoodStandingCount: number;
         totalCollectedPayments: number;
     }> {
-        const [accounts, billings, payments] = await Promise.all([
-            this.propertyRepo.find(),
-            this.billingRepo.find({ order: { dueDate: 'DESC' } }),
-            this.paymentRepo.find({ where: { isDeletedFromFoxpro: false } }),
-        ]);
+        const [summary] = await this.dataSource.query(`
+            SELECT
+                latest.latest_month AS latest_month,
+                COUNT(DISTINCT CASE
+                    WHEN (m.principal + m.interest + m.penalty) > 0 THEN m.id
+                END) AS unpaid_accounts,
+                COUNT(DISTINCT CASE
+                    WHEN (m.principal + m.interest + m.penalty) < 0 THEN m.id
+                END) AS overpaid_accounts,
+                COUNT(DISTINCT CASE
+                    WHEN (m.principal + m.interest + m.penalty) = 0 THEN m.id
+                END) AS settled_accounts,
+                COALESCE(SUM(CASE
+                    WHEN c.collection_date >= STR_TO_DATE(CONCAT(latest.latest_month, '-01'), '%Y-%m-%d')
+                     AND c.collection_date <= LAST_DAY(STR_TO_DATE(CONCAT(latest.latest_month, '-01'), '%Y-%m-%d'))
+                    THEN COALESCE(NULLIF(c.net_amount, 0), c.amount)
+                    ELSE 0
+                END), 0) AS total_collected_payments
+            FROM members m
+            LEFT JOIN collections c ON c.member_id = m.id
+            CROSS JOIN (
+                SELECT MAX(billing_month) AS latest_month
+                FROM billings
+            ) latest
+            GROUP BY latest.latest_month
+        `);
 
-        const parseDate = (value: unknown) => {
-            if (!value) {
-                return null;
-            }
-            const date = new Date(value as string);
-            return Number.isNaN(date.getTime()) ? null : date;
+        const [overdue] = await this.dataSource.query(`
+            SELECT COUNT(*) AS not_good_standing
+            FROM members m
+            WHERE (
+                SELECT COUNT(DISTINCT billing_month)
+                FROM billings b
+                WHERE b.member_id = m.id
+                  AND b.billing_month < (
+                      SELECT MAX(billing_month) FROM billings
+                  )
+                  AND b.amount > 0
+            ) >= 12
+            AND (m.principal + m.interest + m.penalty) > 0
+        `);
+
+        const latestMonth = summary?.latest_month || null;
+        const currentBillingLabel = latestMonth
+            ? `${this.formatBillingMonthStart(latestMonth)} - ${this.formatBillingMonthEnd(latestMonth)}`
+            : '-';
+
+        return {
+            currentBillingLabel,
+            unpaidAccountsCount: Number(summary?.unpaid_accounts || 0),
+            overpaidAccountsCount: Number(summary?.overpaid_accounts || 0),
+            settledAccountsCount: Number(summary?.settled_accounts || 0),
+            notGoodStandingCount: Number(overdue?.not_good_standing || 0),
+            totalCollectedPayments: Number(summary?.total_collected_payments || 0),
         };
+    }
 
-        const dateKey = (value: unknown) => {
-            const parsed = parseDate(value);
-            return parsed ? parsed.toISOString().slice(0, 10) : null;
-        };
-
-        const toCents = (value: unknown) => Math.round(Number(value || 0) * 100);
-
-        let latestPeriod: { fromKey: string | null; toKey: string } | null = null;
-        for (const row of billings) {
-            const toKey = dateKey(row?.dateTo) || dateKey(row?.dateFrom);
-            if (!toKey) {
-                continue;
-            }
-
-            latestPeriod = {
-                fromKey: dateKey(row?.dateFrom) || toKey,
-                toKey,
-            };
-            break;
+    async getPaymentsCollectionReport(): Promise<any> {
+        const [latest] = await this.dataSource.query(
+            'SELECT MAX(billing_month) AS latest_month FROM billings',
+        );
+        const latestMonth = latest?.latest_month || null;
+        if (!latestMonth) {
+            return { currentBillingLabel: '-', billingStartKey: null, billingEndKey: null, items: [] };
         }
 
-        const formatDate = (value: unknown) => {
-            const date = value instanceof Date ? value : parseDate(value);
-            return date ? date.toLocaleDateString() : '-';
-        };
-
-        const formatKey = (key: string | null) => {
-            if (!key) {
-                return '-';
-            }
-            const date = new Date(`${key}T00:00:00.000Z`);
-            return formatDate(date);
-        };
-
-        const currentBillingLabel = latestPeriod?.fromKey && latestPeriod?.toKey
-            ? `${formatKey(latestPeriod.fromKey)} - ${formatKey(latestPeriod.toKey)}`
-            : latestPeriod?.toKey
-                ? formatKey(latestPeriod.toKey)
-                : '-';
-
-        let unpaidAccountsCount = 0;
-        let overpaidAccountsCount = 0;
-        let settledAccountsCount = 0;
-        let notGoodStandingCount = 0;
-
-        const cutoffDate = new Date();
-        cutoffDate.setMonth(cutoffDate.getMonth() - 6);
-        const cutoffKey = cutoffDate.toISOString().slice(0, 10);
-
-        const billingsByAccount = new Map<string, FoxproBilling[]>();
-        for (const billing of billings) {
-            if (!billing.accountId) {
-                continue;
-            }
-            if (!billingsByAccount.has(billing.accountId)) {
-                billingsByAccount.set(billing.accountId, []);
-            }
-            billingsByAccount.get(billing.accountId)?.push(billing);
-        }
-
-        const paymentsByAccount = new Map<string, FoxproPayment[]>();
-        for (const payment of payments) {
-            if (!payment.accountId) {
-                continue;
-            }
-            if (!paymentsByAccount.has(payment.accountId)) {
-                paymentsByAccount.set(payment.accountId, []);
-            }
-            paymentsByAccount.get(payment.accountId)?.push(payment);
-        }
-
-        const accountsByAccountId = new Map(
-            accounts.map((account) => [account.accountId ?? '', account]),
+        const rows = await this.dataSource.query(
+                        `SELECT COALESCE(NULLIF(TRIM(payment_method), ''), NULLIF(TRIM(payment_type), ''), 'Uncategorized') AS paycat,
+                    COUNT(*) AS count,
+                    COALESCE(SUM(COALESCE(NULLIF(net_amount, 0), amount)), 0) AS total
+             FROM collections
+             WHERE collection_date >= STR_TO_DATE(CONCAT(?, '-01'), '%Y-%m-%d')
+               AND collection_date <= LAST_DAY(STR_TO_DATE(CONCAT(?, '-01'), '%Y-%m-%d'))
+             GROUP BY paycat
+             ORDER BY total DESC`,
+            [latestMonth, latestMonth],
         );
 
-        for (const account of accounts) {
-            const accountId = account.accountId || '';
-            if (!accountId) {
-                continue;
-            }
-            const latestBilling = billingsByAccount.get(accountId)?.[0] ?? null;
-
-            // Calculate Amount Due / Excess like SOA preview:
-            // (prinBal + intBal + penBal) + (prinCurr + intCurr + penCurr) - membershipDuesPayments
-            const principalBalance = Number(latestBilling?.prinBal || 0);
-            const interestBalance = Number(latestBilling?.intBal || 0);
-            const penaltyBalance = Number(latestBilling?.penBal || 0);
-            const carryingBalance = principalBalance + interestBalance + penaltyBalance;
-
-            const currentPrincipal = Number(latestBilling?.prinCurr || 0);
-            const currentInterest = Number(latestBilling?.intCurr || 0);
-            const currentPenalty = Number(latestBilling?.penCurr || 0);
-            const currentCharges = currentPrincipal + currentInterest + currentPenalty;
-
-            // Calculate membership dues payments within the billing period
-            let membershipPayments = 0;
-            const billingStart = latestBilling?.dateFrom ? new Date(latestBilling.dateFrom) : null;
-            const billingEnd = latestBilling?.dateTo ? new Date(latestBilling.dateTo) : null;
-
-            if (billingStart && billingEnd && !Number.isNaN(billingStart.getTime()) && !Number.isNaN(billingEnd.getTime())) {
-                const accountPayments = paymentsByAccount.get(accountId) || [];
-                for (const payment of accountPayments) {
-                    if (!payment.paymentDate) {
-                        continue;
-                    }
-                    const paymentDate = new Date(payment.paymentDate);
-                    if (!Number.isNaN(paymentDate.getTime()) && paymentDate >= billingStart && paymentDate <= billingEnd) {
-                        const paycat = String(payment.paycat || '').trim().toLowerCase();
-                        if (paycat === 'membership dues') {
-                            membershipPayments += Number(payment.amountPaid || 0);
-                        }
-                    }
-                }
-            }
-
-            const amountDue = Number(accountsByAccountId.get(accountId)?.balance ?? 0);
-            const amountDueCents = toCents(amountDue);
-
-            const accountPayments = paymentsByAccount.get(accountId) || [];
-            const lastPaymentDate = accountPayments.reduce<Date | null>((latest, payment) => {
-                const paycat = String(payment.paycat || '').trim().toLowerCase();
-                if (paycat !== 'membership dues') {
-                    return latest;
-                }
-
-                const parsed = parseDate(payment.paymentDate);
-                if (!parsed) {
-                    return latest;
-                }
-                if (!latest || parsed > latest) {
-                    return parsed;
-                }
-                return latest;
-            }, null);
-            const lastPaymentKey = lastPaymentDate ? lastPaymentDate.toISOString().slice(0, 10) : null;
-            const noRecentPayments = !lastPaymentKey || lastPaymentKey <= cutoffKey;
-            const notGoodStandingThreshold = currentPrincipal * 4;
-            if (currentPrincipal > 0 && amountDueCents > 0 && amountDue >= notGoodStandingThreshold && noRecentPayments) {
-                notGoodStandingCount += 1;
-            }
-
-            if (amountDueCents > 0) {
-                unpaidAccountsCount += 1;
-            } else if (amountDueCents < 0) {
-                overpaidAccountsCount += 1;
-            } else {
-                settledAccountsCount += 1;
-            }
-        }
-
-        let totalCollectedPayments = 0;
-        if (latestPeriod?.fromKey && latestPeriod?.toKey) {
-            for (const payment of payments) {
-                const paymentKey = dateKey(payment?.paymentDate);
-                if (!paymentKey) {
-                    continue;
-                }
-
-                if (paymentKey >= latestPeriod.fromKey && paymentKey <= latestPeriod.toKey) {
-                    totalCollectedPayments += Number(payment?.amountPaid || 0);
-                }
-            }
-        }
-
         return {
-            currentBillingLabel,
-            unpaidAccountsCount,
-            overpaidAccountsCount,
-            settledAccountsCount,
-            notGoodStandingCount,
-            totalCollectedPayments,
+            currentBillingLabel: `${this.formatBillingMonthStart(latestMonth)} - ${this.formatBillingMonthEnd(latestMonth)}`,
+            billingStartKey: `${latestMonth}-01`,
+            billingEndKey: `${latestMonth}-${this.formatBillingMonthEnd(latestMonth).split('/')[1]}`,
+            items: rows.map((row: Record<string, unknown>) => ({
+                paycat: String(row.paycat || 'Uncategorized'),
+                count: Number(row.count || 0),
+                total: Number(row.total || 0),
+            })),
         };
     }
 
-    async getPaymentsCollectionReport(): Promise<{
-        currentBillingLabel: string;
-        billingStartKey: string | null;
-        billingEndKey: string | null;
-        items: Array<{
-            paycat: string;
-            count: number;
-            total: number;
-        }>;
-    }> {
-        const [billings, payments] = await Promise.all([
-            this.billingRepo.find({ order: { dueDate: 'DESC' } }),
-            this.paymentRepo.find({ where: { isDeletedFromFoxpro: false } }),
-        ]);
-
-        const parseDate = (value: unknown) => {
-            if (!value) {
-                return null;
-            }
-            const date = new Date(value as string);
-            return Number.isNaN(date.getTime()) ? null : date;
-        };
-
-        const dateKey = (value: unknown) => {
-            const parsed = parseDate(value);
-            return parsed ? parsed.toISOString().slice(0, 10) : null;
-        };
-
-        let latestPeriod: { fromKey: string | null; toKey: string } | null = null;
-        for (const row of billings) {
-            const toKey = dateKey(row?.dateTo) || dateKey(row?.dateFrom);
-            if (!toKey) {
-                continue;
-            }
-
-            latestPeriod = {
-                fromKey: dateKey(row?.dateFrom) || toKey,
-                toKey,
-            };
-            break;
-        }
-
-        const formatDate = (value: unknown) => {
-            const date = value instanceof Date ? value : parseDate(value);
-            return date ? date.toLocaleDateString() : '-';
-        };
-
-        const formatKey = (key: string | null) => {
-            if (!key) {
-                return '-';
-            }
-            const date = new Date(`${key}T00:00:00.000Z`);
-            return formatDate(date);
-        };
-
-        const currentBillingLabel = latestPeriod?.fromKey && latestPeriod?.toKey
-            ? `${formatKey(latestPeriod.fromKey)} - ${formatKey(latestPeriod.toKey)}`
-            : latestPeriod?.toKey
-                ? formatKey(latestPeriod.toKey)
-                : '-';
-
-        const byPaycat = new Map<string, { paycat: string; count: number; total: number }>();
-
-        if (latestPeriod?.fromKey && latestPeriod?.toKey) {
-            for (const payment of payments) {
-                const paymentKey = dateKey(payment?.paymentDate);
-                if (!paymentKey) {
-                    continue;
-                }
-
-                if (paymentKey < latestPeriod.fromKey || paymentKey > latestPeriod.toKey) {
-                    continue;
-                }
-
-                const rawPaycat = String(payment?.paycat || '').trim();
-                const paycat = rawPaycat || 'Uncategorized';
-                const current = byPaycat.get(paycat) || { paycat, count: 0, total: 0 };
-                current.count += 1;
-                current.total += Number(payment?.amountPaid || 0);
-                byPaycat.set(paycat, current);
-            }
-        }
-
-        const items = Array.from(byPaycat.values()).sort((a, b) => b.total - a.total);
-
-        return {
-            currentBillingLabel,
-            billingStartKey: latestPeriod?.fromKey || null,
-            billingEndKey: latestPeriod?.toKey || null,
-            items,
-        };
-    }
-
-    async getPaymentsByCategoryReport(paycat: string): Promise<{
-        currentBillingLabel: string;
-        billingStartKey: string | null;
-        billingEndKey: string | null;
-        paycat: string;
-        items: Array<{
-            accountId: string | null;
-            memberName: string | null;
-            paymentDate: Date | null;
-            amountPaid: number;
-            description: string | null;
-            referenceNumber: string | null;
-            paycat: string | null;
-        }>;
-    }> {
-        const normalizedInput = String(paycat || '').trim();
-        if (!normalizedInput) {
+    async getPaymentsByCategoryReport(paycat: string): Promise<any> {
+        const normalizedPaycat = String(paycat || '').trim();
+        if (!normalizedPaycat) {
             throw new BadRequestException('Pay category is required');
         }
 
-        const normalizedKey = normalizedInput.toLowerCase();
-
-        const [billings, payments] = await Promise.all([
-            this.billingRepo.find({ order: { dueDate: 'DESC' } }),
-            this.paymentRepo.find({ where: { isDeletedFromFoxpro: false } }),
-        ]);
-
-        const parseDate = (value: unknown) => {
-            if (!value) {
-                return null;
-            }
-            const date = value instanceof Date ? value : new Date(value as string);
-            return Number.isNaN(date.getTime()) ? null : date;
-        };
-
-        const dateKey = (value: unknown) => {
-            const parsed = parseDate(value);
-            return parsed ? parsed.toISOString().slice(0, 10) : null;
-        };
-
-        const formatDate = (value: unknown) => {
-            const date = parseDate(value);
-            return date ? date.toLocaleDateString() : '-';
-        };
-
-        const formatKey = (key: string | null) => {
-            if (!key) {
-                return '-';
-            }
-            const date = new Date(`${key}T00:00:00.000Z`);
-            return formatDate(date);
-        };
-
-        let latestPeriod: { fromKey: string | null; toKey: string } | null = null;
-        for (const row of billings) {
-            const toKey = dateKey(row?.dateTo) || dateKey(row?.dateFrom);
-            if (!toKey) {
-                continue;
-            }
-
-            latestPeriod = {
-                fromKey: dateKey(row?.dateFrom) || toKey,
-                toKey,
-            };
-            break;
+        const [latest] = await this.dataSource.query(
+            'SELECT MAX(billing_month) AS latest_month FROM billings',
+        );
+        const latestMonth = latest?.latest_month || null;
+        if (!latestMonth) {
+            return { currentBillingLabel: '-', billingStartKey: null, billingEndKey: null, paycat: normalizedPaycat, items: [] };
         }
 
-        const currentBillingLabel = latestPeriod?.fromKey && latestPeriod?.toKey
-            ? `${formatKey(latestPeriod.fromKey)} - ${formatKey(latestPeriod.toKey)}`
-            : latestPeriod?.toKey
-                ? formatKey(latestPeriod.toKey)
-                : '-';
-
-        const matchesPaycat = (value: string | null | undefined) => {
-            const raw = String(value || '').trim();
-            const key = raw.toLowerCase();
-            if (normalizedKey === 'uncategorized') {
-                return key === '' || key === 'uncategorized';
-            }
-            return key === normalizedKey;
-        };
-
-        const items: Array<{
-            accountId: string | null;
-            memberName: string | null;
-            paymentDate: Date | null;
-            amountPaid: number;
-            description: string | null;
-            referenceNumber: string | null;
-            paycat: string | null;
-        }> = [];
-
-        const accountIds = new Set<string>();
-        for (const payment of payments) {
-            if (payment?.accountId) {
-                accountIds.add(payment.accountId);
-            }
-        }
-
-        const accounts = accountIds.size
-            ? await this.propertyRepo.find({ where: { accountId: In(Array.from(accountIds)) } })
-            : [];
-        const accountMap = new Map(
-            accounts.map((account) => [account.accountId ?? '', account]),
+        const rows = await this.dataSource.query(`
+            SELECT CONCAT(m.block_code, '-', m.lot_code) AS accountId,
+                   m.registered_owners AS memberName,
+                   c.collection_date AS paymentDate,
+                   COALESCE(NULLIF(c.net_amount, 0), c.amount) AS amountPaid,
+                   c.remarks AS description,
+                   c.reference_number AS referenceNumber,
+                   COALESCE(NULLIF(TRIM(c.payment_method), ''), NULLIF(TRIM(c.payment_type), ''), 'Uncategorized') AS paycat
+            FROM collections c
+            INNER JOIN members m ON m.id = c.member_id
+            WHERE c.collection_date >= STR_TO_DATE(CONCAT(?, '-01'), '%Y-%m-%d')
+              AND c.collection_date <= LAST_DAY(STR_TO_DATE(CONCAT(?, '-01'), '%Y-%m-%d'))
+              AND COALESCE(NULLIF(TRIM(c.payment_method), ''), NULLIF(TRIM(c.payment_type), ''), 'Uncategorized') = ?
+            ORDER BY c.collection_date DESC, c.id DESC`,
+            [latestMonth, latestMonth, normalizedPaycat],
         );
 
-        if (latestPeriod?.fromKey && latestPeriod?.toKey) {
-            for (const payment of payments) {
-                const paymentKey = dateKey(payment?.paymentDate);
-                if (!paymentKey) {
-                    continue;
-                }
+        return {
+            currentBillingLabel: `${this.formatBillingMonthStart(latestMonth)} - ${this.formatBillingMonthEnd(latestMonth)}`,
+            billingStartKey: `${latestMonth}-01`,
+            billingEndKey: `${latestMonth}-${this.formatBillingMonthEnd(latestMonth).split('/')[1]}`,
+            paycat: normalizedPaycat,
+            items: rows.map((row: Record<string, unknown>) => ({
+                ...row,
+                amountPaid: Number(row.amountPaid || 0),
+            })),
+        };
+    }
 
-                if (paymentKey < latestPeriod.fromKey || paymentKey > latestPeriod.toKey) {
-                    continue;
-                }
+    private async getAccountingMemberReport(
+        reportType: 'settled' | 'overpaid' | 'unpaid' | 'not_good_standing',
+    ) {
+        const condition = {
+            settled: '(m.principal + m.interest + m.penalty) = 0',
+            overpaid: '(m.principal + m.interest + m.penalty) < 0',
+            unpaid: '(m.principal + m.interest + m.penalty) > 0',
+            not_good_standing: `(
+                SELECT COUNT(DISTINCT overdue.billing_month)
+                FROM billings overdue
+                WHERE overdue.member_id = m.id
+                  AND overdue.billing_month < latest.latest_month
+                  AND overdue.amount > 0
+            ) >= 12 AND (m.principal + m.interest + m.penalty) > 0`,
+        }[reportType];
 
-                if (!matchesPaycat(payment?.paycat ?? null)) {
-                    continue;
-                }
+        const rows = await this.dataSource.query(`
+            SELECT
+                CONCAT(m.block_code, '-', m.lot_code) AS accountId,
+                m.registered_owners AS memberName,
+                m.classification,
+                '' AS neighborhood,
+                m.block_code AS block,
+                m.lot_code AS lot,
+                m.email AS gmail,
+                m.telephone_number AS telno,
+                m.cellphone_number AS celno,
+                (m.principal + m.interest + m.penalty) AS amountDue,
+                (
+                    SELECT MAX(c.collection_date)
+                    FROM collections c
+                    WHERE c.member_id = m.id
+                ) AS lastPaymentDate,
+                latest.latest_month
+            FROM members m
+            CROSS JOIN (
+                SELECT MAX(billing_month) AS latest_month
+                FROM billings
+            ) latest
+            WHERE ${condition}
+            ORDER BY CAST(m.block_code AS UNSIGNED), CAST(m.lot_code AS UNSIGNED), m.id
+        `);
 
-                const account = accountMap.get(payment?.accountId ?? '');
-
-                items.push({
-                    accountId: payment?.accountId ?? null,
-                    memberName: account?.memberName ?? null,
-                    paymentDate: payment?.paymentDate ?? null,
-                    amountPaid: Number(payment?.amountPaid || 0),
-                    description: payment?.description ?? null,
-                    referenceNumber: payment?.referenceNumber ?? null,
-                    paycat: payment?.paycat ?? null,
-                });
-            }
-        }
-
-        items.sort((a, b) => {
-            const aTime = a.paymentDate ? new Date(a.paymentDate).getTime() : 0;
-            const bTime = b.paymentDate ? new Date(b.paymentDate).getTime() : 0;
-            if (bTime !== aTime) {
-                return bTime - aTime;
-            }
-            return String(a.accountId || '').localeCompare(String(b.accountId || ''), 'en', { numeric: true });
-        });
+        const latestMonth = rows[0]?.latest_month || (
+            await this.dataSource.query('SELECT MAX(billing_month) AS latest_month FROM billings')
+        )[0]?.latest_month || null;
 
         return {
-            currentBillingLabel,
-            billingStartKey: latestPeriod?.fromKey || null,
-            billingEndKey: latestPeriod?.toKey || null,
-            paycat: normalizedInput,
-            items,
+            currentBillingLabel: latestMonth
+                ? `${this.formatBillingMonthStart(latestMonth)} - ${this.formatBillingMonthEnd(latestMonth)}`
+                : '-',
+            billingEndDateKey: latestMonth
+                ? `${latestMonth}-${this.formatBillingMonthEnd(latestMonth).split('/')[1]}`
+                : null,
+            items: rows.map((row: Record<string, unknown>) => ({
+                ...row,
+                amountDue: Number(row.amountDue || 0),
+            })),
         };
     }
 
     async getSettledAccountsReport(): Promise<{
         currentBillingLabel: string;
         billingEndDateKey: string | null;
-        items: Array<{
-            accountId: string;
-            memberName: string;
-            classification: string | null;
-            neighborhood: string;
-            block: string;
-            lot: string;
-            amountDue: number;
-            lastPaymentDate: Date | null;
-        }>;
+        items: Array<Record<string, unknown>>;
     }> {
-        const [billings, payments] = await Promise.all([
-            this.billingRepo.find({ order: { dueDate: 'DESC' } }),
-            this.paymentRepo.find({ where: { isDeletedFromFoxpro: false } }),
-        ]);
-
-        const parseDate = (value: unknown) => {
-            if (!value) {
-                return null;
-            }
-            const date = value instanceof Date ? value : new Date(value as string);
-            return Number.isNaN(date.getTime()) ? null : date;
-        };
-
-        const dateKey = (value: unknown) => {
-            const parsed = parseDate(value);
-            return parsed ? parsed.toISOString().slice(0, 10) : null;
-        };
-
-        const formatDate = (value: unknown) => {
-            const date = parseDate(value);
-            return date ? date.toLocaleDateString() : '-';
-        };
-
-        const formatKey = (key: string | null) => {
-            if (!key) {
-                return '-';
-            }
-            const date = new Date(`${key}T00:00:00.000Z`);
-            return formatDate(date);
-        };
-
-        const toCents = (value: unknown) => Math.round(Number(value || 0) * 100);
-
-        let latestPeriod: { fromKey: string | null; toKey: string } | null = null;
-        for (const row of billings) {
-            const toKey = dateKey(row?.dateTo) || dateKey(row?.dateFrom);
-            if (!toKey) {
-                continue;
-            }
-
-            latestPeriod = {
-                fromKey: dateKey(row?.dateFrom) || toKey,
-                toKey,
-            };
-            break;
-        }
-
-        const currentBillingLabel = latestPeriod?.fromKey && latestPeriod?.toKey
-            ? `${formatKey(latestPeriod.fromKey)} - ${formatKey(latestPeriod.toKey)}`
-            : latestPeriod?.toKey
-                ? formatKey(latestPeriod.toKey)
-                : '-';
-        const billingEndDateKey = latestPeriod?.toKey ?? null;
-
-        const billingsByAccount = new Map<string, FoxproBilling[]>();
-        const accountIds = new Set<string>();
-        for (const billing of billings) {
-            if (!billing.accountId) {
-                continue;
-            }
-            accountIds.add(billing.accountId);
-            if (!billingsByAccount.has(billing.accountId)) {
-                billingsByAccount.set(billing.accountId, []);
-            }
-            billingsByAccount.get(billing.accountId)?.push(billing);
-        }
-
-        const paymentsByAccount = new Map<string, FoxproPayment[]>();
-        for (const payment of payments) {
-            if (!payment.accountId) {
-                continue;
-            }
-            if (!paymentsByAccount.has(payment.accountId)) {
-                paymentsByAccount.set(payment.accountId, []);
-            }
-            paymentsByAccount.get(payment.accountId)?.push(payment);
-        }
-
-        const accounts = await this.propertyRepo.find();
-        const accountMap = new Map(
-            accounts.map((account) => [account.accountId ?? '', account]),
-        );
-
-        const items: Array<{
-            accountId: string;
-            memberName: string;
-            classification: string | null;
-            neighborhood: string;
-            block: string;
-            lot: string;
-            amountDue: number;
-            lastPaymentDate: Date | null;
-        }> = [];
-
-        for (const accountEntry of accounts) {
-            const accountId = accountEntry.accountId || '';
-            if (!accountId) {
-                continue;
-            }
-            const latestBilling = billingsByAccount.get(accountId)?.[0] ?? null;
-            const principalBalance = Number(latestBilling?.prinBal || 0);
-            const interestBalance = Number(latestBilling?.intBal || 0);
-            const penaltyBalance = Number(latestBilling?.penBal || 0);
-            const carryingBalance = principalBalance + interestBalance + penaltyBalance;
-
-            const currentPrincipal = Number(latestBilling?.prinCurr || 0);
-            const currentInterest = Number(latestBilling?.intCurr || 0);
-            const currentPenalty = Number(latestBilling?.penCurr || 0);
-            const currentCharges = currentPrincipal + currentInterest + currentPenalty;
-
-            let membershipPayments = 0;
-            const billingStart = latestBilling?.dateFrom ? new Date(latestBilling.dateFrom) : null;
-            const billingEnd = latestBilling?.dateTo ? new Date(latestBilling.dateTo) : null;
-
-            if (billingStart && billingEnd && !Number.isNaN(billingStart.getTime()) && !Number.isNaN(billingEnd.getTime())) {
-                const accountPayments = paymentsByAccount.get(accountId) || [];
-                for (const payment of accountPayments) {
-                    if (!payment.paymentDate) {
-                        continue;
-                    }
-                    const paymentDate = new Date(payment.paymentDate);
-                    if (!Number.isNaN(paymentDate.getTime()) && paymentDate >= billingStart && paymentDate <= billingEnd) {
-                        const paycat = String(payment.paycat || '').trim().toLowerCase();
-                        if (paycat === 'membership dues') {
-                            membershipPayments += Number(payment.amountPaid || 0);
-                        }
-                    }
-                }
-            }
-
-            const amountDue = Number(accountMap.get(accountId)?.balance ?? 0);
-            if (toCents(amountDue) !== 0) {
-                continue;
-            }
-
-            const account = accountMap.get(accountId);
-            const accountPayments = paymentsByAccount.get(accountId) || [];
-            const lastPaymentDate = accountPayments.reduce<Date | null>((latest, payment) => {
-                const paycat = String(payment.paycat || '').trim().toLowerCase();
-                if (paycat !== 'membership dues') {
-                    return latest;
-                }
-
-                const parsed = parseDate(payment.paymentDate);
-                if (!parsed) {
-                    return latest;
-                }
-                if (!latest || parsed > latest) {
-                    return parsed;
-                }
-                return latest;
-            }, null);
-
-            items.push({
-                accountId,
-                memberName: account?.memberName ?? '-',
-                classification: account?.classification ?? null,
-                neighborhood: account?.neighborhood ?? '-',
-                block: account?.block ?? '-',
-                lot: account?.lot ?? '-',
-                amountDue,
-                lastPaymentDate,
-            });
-        }
-
-        items.sort((a, b) => a.accountId.localeCompare(b.accountId, 'en', { numeric: true }));
-
-        return {
-            currentBillingLabel,
-            billingEndDateKey,
-            items,
-        };
+        return this.getAccountingMemberReport('settled');
     }
 
     async getOverpaidAccountsReport(): Promise<{
         currentBillingLabel: string;
         billingEndDateKey: string | null;
-        items: Array<{
-            accountId: string;
-            memberName: string;
-            classification: string | null;
-            neighborhood: string;
-            block: string;
-            lot: string;
-            amountDue: number;
-            lastPaymentDate: Date | null;
-        }>;
+        items: Array<Record<string, unknown>>;
     }> {
-        const [billings, payments] = await Promise.all([
-            this.billingRepo.find({ order: { dueDate: 'DESC' } }),
-            this.paymentRepo.find({ where: { isDeletedFromFoxpro: false } }),
-        ]);
-
-        const parseDate = (value: unknown) => {
-            if (!value) {
-                return null;
-            }
-            const date = value instanceof Date ? value : new Date(value as string);
-            return Number.isNaN(date.getTime()) ? null : date;
-        };
-
-        const dateKey = (value: unknown) => {
-            const parsed = parseDate(value);
-            return parsed ? parsed.toISOString().slice(0, 10) : null;
-        };
-
-        const formatDate = (value: unknown) => {
-            const date = parseDate(value);
-            return date ? date.toLocaleDateString() : '-';
-        };
-
-        const formatKey = (key: string | null) => {
-            if (!key) {
-                return '-';
-            }
-            const date = new Date(`${key}T00:00:00.000Z`);
-            return formatDate(date);
-        };
-
-        const toCents = (value: unknown) => Math.round(Number(value || 0) * 100);
-
-        let latestPeriod: { fromKey: string | null; toKey: string } | null = null;
-        for (const row of billings) {
-            const toKey = dateKey(row?.dateTo) || dateKey(row?.dateFrom);
-            if (!toKey) {
-                continue;
-            }
-
-            latestPeriod = {
-                fromKey: dateKey(row?.dateFrom) || toKey,
-                toKey,
-            };
-            break;
-        }
-
-        const currentBillingLabel = latestPeriod?.fromKey && latestPeriod?.toKey
-            ? `${formatKey(latestPeriod.fromKey)} - ${formatKey(latestPeriod.toKey)}`
-            : latestPeriod?.toKey
-                ? formatKey(latestPeriod.toKey)
-                : '-';
-        const billingEndDateKey = latestPeriod?.toKey ?? null;
-
-        const billingsByAccount = new Map<string, FoxproBilling[]>();
-        const accountIds = new Set<string>();
-        for (const billing of billings) {
-            if (!billing.accountId) {
-                continue;
-            }
-            accountIds.add(billing.accountId);
-            if (!billingsByAccount.has(billing.accountId)) {
-                billingsByAccount.set(billing.accountId, []);
-            }
-            billingsByAccount.get(billing.accountId)?.push(billing);
-        }
-
-        const paymentsByAccount = new Map<string, FoxproPayment[]>();
-        for (const payment of payments) {
-            if (!payment.accountId) {
-                continue;
-            }
-            if (!paymentsByAccount.has(payment.accountId)) {
-                paymentsByAccount.set(payment.accountId, []);
-            }
-            paymentsByAccount.get(payment.accountId)?.push(payment);
-        }
-
-        const accounts = await this.propertyRepo.find();
-        const accountMap = new Map(
-            accounts.map((account) => [account.accountId ?? '', account]),
-        );
-
-        const items: Array<{
-            accountId: string;
-            memberName: string;
-            classification: string | null;
-            neighborhood: string;
-            block: string;
-            lot: string;
-            amountDue: number;
-            lastPaymentDate: Date | null;
-        }> = [];
-
-        for (const accountEntry of accounts) {
-            const accountId = accountEntry.accountId || '';
-            if (!accountId) {
-                continue;
-            }
-            const latestBilling = billingsByAccount.get(accountId)?.[0] ?? null;
-            const principalBalance = Number(latestBilling?.prinBal || 0);
-            const interestBalance = Number(latestBilling?.intBal || 0);
-            const penaltyBalance = Number(latestBilling?.penBal || 0);
-            const carryingBalance = principalBalance + interestBalance + penaltyBalance;
-
-            const currentPrincipal = Number(latestBilling?.prinCurr || 0);
-            const currentInterest = Number(latestBilling?.intCurr || 0);
-            const currentPenalty = Number(latestBilling?.penCurr || 0);
-            const currentCharges = currentPrincipal + currentInterest + currentPenalty;
-
-            let membershipPayments = 0;
-            const billingStart = latestBilling?.dateFrom ? new Date(latestBilling.dateFrom) : null;
-            const billingEnd = latestBilling?.dateTo ? new Date(latestBilling.dateTo) : null;
-
-            if (billingStart && billingEnd && !Number.isNaN(billingStart.getTime()) && !Number.isNaN(billingEnd.getTime())) {
-                const accountPayments = paymentsByAccount.get(accountId) || [];
-                for (const payment of accountPayments) {
-                    if (!payment.paymentDate) {
-                        continue;
-                    }
-                    const paymentDate = new Date(payment.paymentDate);
-                    if (!Number.isNaN(paymentDate.getTime()) && paymentDate >= billingStart && paymentDate <= billingEnd) {
-                        const paycat = String(payment.paycat || '').trim().toLowerCase();
-                        if (paycat === 'membership dues') {
-                            membershipPayments += Number(payment.amountPaid || 0);
-                        }
-                    }
-                }
-            }
-
-            const amountDue = Number(accountMap.get(accountId)?.balance ?? 0);
-            if (toCents(amountDue) >= 0) {
-                continue;
-            }
-
-            const account = accountMap.get(accountId);
-            const accountPayments = paymentsByAccount.get(accountId) || [];
-            const lastPaymentDate = accountPayments.reduce<Date | null>((latest, payment) => {
-                const parsed = parseDate(payment.paymentDate);
-                if (!parsed) {
-                    return latest;
-                }
-                if (!latest || parsed > latest) {
-                    return parsed;
-                }
-                return latest;
-            }, null);
-
-            items.push({
-                accountId,
-                memberName: account?.memberName ?? '-',
-                classification: account?.classification ?? null,
-                neighborhood: account?.neighborhood ?? '-',
-                block: account?.block ?? '-',
-                lot: account?.lot ?? '-',
-                amountDue,
-                lastPaymentDate,
-            });
-        }
-
-        items.sort((a, b) => a.accountId.localeCompare(b.accountId, 'en', { numeric: true }));
-
-        return {
-            currentBillingLabel,
-            billingEndDateKey,
-            items,
-        };
+        return this.getAccountingMemberReport('overpaid');
     }
 
     async getUnpaidAccountsReport(): Promise<{
         currentBillingLabel: string;
         billingEndDateKey: string | null;
-        items: Array<{
-            accountId: string;
-            memberName: string;
-            classification: string | null;
-            neighborhood: string;
-            block: string;
-            lot: string;
-            gmail: string | null;
-            telno: string | null;
-            celno: string | null;
-            amountDue: number;
-            lastPaymentDate: Date | null;
-        }>;
+        items: Array<Record<string, unknown>>;
     }> {
-        const [billings, payments] = await Promise.all([
-            this.billingRepo.find({ order: { dueDate: 'DESC' } }),
-            this.paymentRepo.find({ where: { isDeletedFromFoxpro: false } }),
-        ]);
-
-        const parseDate = (value: unknown) => {
-            if (!value) {
-                return null;
-            }
-            const date = value instanceof Date ? value : new Date(value as string);
-            return Number.isNaN(date.getTime()) ? null : date;
-        };
-
-        const dateKey = (value: unknown) => {
-            const parsed = parseDate(value);
-            return parsed ? parsed.toISOString().slice(0, 10) : null;
-        };
-
-        const formatDate = (value: unknown) => {
-            const date = parseDate(value);
-            return date ? date.toLocaleDateString() : '-';
-        };
-
-        const formatKey = (key: string | null) => {
-            if (!key) {
-                return '-';
-            }
-            const date = new Date(`${key}T00:00:00.000Z`);
-            return formatDate(date);
-        };
-
-        const toCents = (value: unknown) => Math.round(Number(value || 0) * 100);
-
-        let latestPeriod: { fromKey: string | null; toKey: string } | null = null;
-        for (const row of billings) {
-            const toKey = dateKey(row?.dateTo) || dateKey(row?.dateFrom);
-            if (!toKey) {
-                continue;
-            }
-
-            latestPeriod = {
-                fromKey: dateKey(row?.dateFrom) || toKey,
-                toKey,
-            };
-            break;
-        }
-
-        const currentBillingLabel = latestPeriod?.fromKey && latestPeriod?.toKey
-            ? `${formatKey(latestPeriod.fromKey)} - ${formatKey(latestPeriod.toKey)}`
-            : latestPeriod?.toKey
-                ? formatKey(latestPeriod.toKey)
-                : '-';
-        const billingEndDateKey = latestPeriod?.toKey ?? null;
-
-        const billingsByAccount = new Map<string, FoxproBilling[]>();
-        const accountIds = new Set<string>();
-        for (const billing of billings) {
-            if (!billing.accountId) {
-                continue;
-            }
-            accountIds.add(billing.accountId);
-            if (!billingsByAccount.has(billing.accountId)) {
-                billingsByAccount.set(billing.accountId, []);
-            }
-            billingsByAccount.get(billing.accountId)?.push(billing);
-        }
-
-        const paymentsByAccount = new Map<string, FoxproPayment[]>();
-        for (const payment of payments) {
-            if (!payment.accountId) {
-                continue;
-            }
-            if (!paymentsByAccount.has(payment.accountId)) {
-                paymentsByAccount.set(payment.accountId, []);
-            }
-            paymentsByAccount.get(payment.accountId)?.push(payment);
-        }
-
-        const accounts = await this.propertyRepo.find();
-        const accountMap = new Map(
-            accounts.map((account) => [account.accountId ?? '', account]),
-        );
-
-        const items: Array<{
-            accountId: string;
-            memberName: string;
-            classification: string | null;
-            neighborhood: string;
-            block: string;
-            lot: string;
-            gmail: string | null;
-            telno: string | null;
-            celno: string | null;
-            amountDue: number;
-            lastPaymentDate: Date | null;
-        }> = [];
-
-        for (const accountEntry of accounts) {
-            const accountId = accountEntry.accountId || '';
-            if (!accountId) {
-                continue;
-            }
-            const latestBilling = billingsByAccount.get(accountId)?.[0] ?? null;
-            const principalBalance = Number(latestBilling?.prinBal || 0);
-            const interestBalance = Number(latestBilling?.intBal || 0);
-            const penaltyBalance = Number(latestBilling?.penBal || 0);
-            const carryingBalance = principalBalance + interestBalance + penaltyBalance;
-
-            const currentPrincipal = Number(latestBilling?.prinCurr || 0);
-            const currentInterest = Number(latestBilling?.intCurr || 0);
-            const currentPenalty = Number(latestBilling?.penCurr || 0);
-            const currentCharges = currentPrincipal + currentInterest + currentPenalty;
-
-            let membershipPayments = 0;
-            const billingStart = latestBilling?.dateFrom ? new Date(latestBilling.dateFrom) : null;
-            const billingEnd = latestBilling?.dateTo ? new Date(latestBilling.dateTo) : null;
-
-            if (billingStart && billingEnd && !Number.isNaN(billingStart.getTime()) && !Number.isNaN(billingEnd.getTime())) {
-                const accountPayments = paymentsByAccount.get(accountId) || [];
-                for (const payment of accountPayments) {
-                    if (!payment.paymentDate) {
-                        continue;
-                    }
-                    const paymentDate = new Date(payment.paymentDate);
-                    if (!Number.isNaN(paymentDate.getTime()) && paymentDate >= billingStart && paymentDate <= billingEnd) {
-                        const paycat = String(payment.paycat || '').trim().toLowerCase();
-                        if (paycat === 'membership dues') {
-                            membershipPayments += Number(payment.amountPaid || 0);
-                        }
-                    }
-                }
-            }
-
-            const amountDue = Number(accountMap.get(accountId)?.balance ?? 0);
-            if (toCents(amountDue) <= 0) {
-                continue;
-            }
-
-            const account = accountMap.get(accountId);
-            const accountPayments = paymentsByAccount.get(accountId) || [];
-            const lastMembershipDuesPaymentDate = accountPayments.reduce<Date | null>((latest, payment) => {
-                const paycat = String(payment.paycat || '').trim().toLowerCase();
-                if (paycat !== 'membership dues') {
-                    return latest;
-                }
-
-                const parsed = parseDate(payment.paymentDate);
-                if (!parsed) {
-                    return latest;
-                }
-                if (!latest || parsed > latest) {
-                    return parsed;
-                }
-                return latest;
-            }, null);
-
-            items.push({
-                accountId,
-                memberName: account?.memberName ?? '-',
-                classification: account?.classification ?? null,
-                neighborhood: account?.neighborhood ?? '-',
-                block: account?.block ?? '-',
-                lot: account?.lot ?? '-',
-                gmail: account?.gmail ?? null,
-                telno: account?.telno ?? null,
-                celno: account?.celno ?? null,
-                amountDue,
-                lastPaymentDate: lastMembershipDuesPaymentDate,
-            });
-        }
-
-        items.sort((a, b) => a.accountId.localeCompare(b.accountId, 'en', { numeric: true }));
-
-        return {
-            currentBillingLabel,
-            billingEndDateKey,
-            items,
-        };
+        return this.getAccountingMemberReport('unpaid');
     }
 
     async getNotGoodStandingReport(status?: string): Promise<{
         currentBillingLabel: string;
         billingEndDateKey: string | null;
-        items: Array<{
-            accountId: string;
-            memberName: string;
-            classification: string | null;
-            neighborhood: string;
-            block: string;
-            lot: string;
-            amountDue: number;
-            lastPaymentDate: Date | null;
-        }>;
+        items: Array<Record<string, unknown>>;
     }> {
-        const [billings, payments] = await Promise.all([
-            this.billingRepo.find({ order: { dueDate: 'DESC' } }),
-            this.paymentRepo.find({ where: { isDeletedFromFoxpro: false } }),
-        ]);
-
-        const parseDate = (value: unknown) => {
-            if (!value) {
-                return null;
-            }
-            const date = value instanceof Date ? value : new Date(value as string);
-            return Number.isNaN(date.getTime()) ? null : date;
-        };
-
-        const dateKey = (value: unknown) => {
-            const parsed = parseDate(value);
-            return parsed ? parsed.toISOString().slice(0, 10) : null;
-        };
-
-        const formatDate = (value: unknown) => {
-            const date = parseDate(value);
-            return date ? date.toLocaleDateString() : '-';
-        };
-
-        const formatKey = (key: string | null) => {
-            if (!key) {
-                return '-';
-            }
-            const date = new Date(`${key}T00:00:00.000Z`);
-            return formatDate(date);
-        };
-
-        let latestPeriod: { fromKey: string | null; toKey: string } | null = null;
-        for (const row of billings) {
-            const toKey = dateKey(row?.dateTo) || dateKey(row?.dateFrom);
-            if (!toKey) {
-                continue;
-            }
-
-            latestPeriod = {
-                fromKey: dateKey(row?.dateFrom) || toKey,
-                toKey,
-            };
-            break;
-        }
-
-        const currentBillingLabel = latestPeriod?.fromKey && latestPeriod?.toKey
-            ? `${formatKey(latestPeriod.fromKey)} - ${formatKey(latestPeriod.toKey)}`
-            : latestPeriod?.toKey
-                ? formatKey(latestPeriod.toKey)
-                : '-';
-        const billingEndDateKey = latestPeriod?.toKey ?? null;
-
-        const billingsByAccount = new Map<string, FoxproBilling[]>();
-        const accountIds = new Set<string>();
-        for (const billing of billings) {
-            if (!billing.accountId) {
-                continue;
-            }
-            accountIds.add(billing.accountId);
-            if (!billingsByAccount.has(billing.accountId)) {
-                billingsByAccount.set(billing.accountId, []);
-            }
-            billingsByAccount.get(billing.accountId)?.push(billing);
-        }
-
-        const paymentsByAccount = new Map<string, FoxproPayment[]>();
-        for (const payment of payments) {
-            if (!payment.accountId) {
-                continue;
-            }
-            if (!paymentsByAccount.has(payment.accountId)) {
-                paymentsByAccount.set(payment.accountId, []);
-            }
-            paymentsByAccount.get(payment.accountId)?.push(payment);
-        }
-
-        const accounts = await this.propertyRepo.find();
-        const accountMap = new Map(
-            accounts.map((account) => [account.accountId ?? '', account]),
-        );
-
-        const normalizedStatus = status?.toLowerCase() === 'good' ? 'good' : 'not';
-        const cutoffDate = new Date();
-        cutoffDate.setMonth(cutoffDate.getMonth() - 6);
-        const cutoffKey = cutoffDate.toISOString().slice(0, 10);
-
-        const items: Array<{
-            accountId: string;
-            memberName: string;
-            classification: string | null;
-            neighborhood: string;
-            block: string;
-            lot: string;
-            amountDue: number;
-            lastPaymentDate: Date | null;
-        }> = [];
-
-        for (const accountEntry of accounts) {
-            const accountId = accountEntry.accountId || '';
-            if (!accountId) {
-                continue;
-            }
-            const latestBilling = billingsByAccount.get(accountId)?.[0] ?? null;
-            const principalBalance = Number(latestBilling?.prinBal || 0);
-            const interestBalance = Number(latestBilling?.intBal || 0);
-            const penaltyBalance = Number(latestBilling?.penBal || 0);
-            const carryingBalance = principalBalance + interestBalance + penaltyBalance;
-
-            const currentPrincipal = Number(latestBilling?.prinCurr || 0);
-            const currentInterest = Number(latestBilling?.intCurr || 0);
-            const currentPenalty = Number(latestBilling?.penCurr || 0);
-            const currentCharges = currentPrincipal + currentInterest + currentPenalty;
-
-            if (currentPrincipal <= 0) {
-                continue;
-            }
-
-            let membershipPayments = 0;
-            const billingStart = latestBilling?.dateFrom ? new Date(latestBilling.dateFrom) : null;
-            const billingEnd = latestBilling?.dateTo ? new Date(latestBilling.dateTo) : null;
-
-            if (billingStart && billingEnd && !Number.isNaN(billingStart.getTime()) && !Number.isNaN(billingEnd.getTime())) {
-                const accountPayments = paymentsByAccount.get(accountId) || [];
-                for (const payment of accountPayments) {
-                    if (!payment.paymentDate) {
-                        continue;
-                    }
-                    const paymentDate = new Date(payment.paymentDate);
-                    if (!Number.isNaN(paymentDate.getTime()) && paymentDate >= billingStart && paymentDate <= billingEnd) {
-                        const paycat = String(payment.paycat || '').trim().toLowerCase();
-                        if (paycat === 'membership dues') {
-                            membershipPayments += Number(payment.amountPaid || 0);
-                        }
-                    }
-                }
-            }
-
-            const amountDue = Number(accountMap.get(accountId)?.balance ?? 0);
-            const threshold = currentPrincipal * 4;
-            const accountPayments = paymentsByAccount.get(accountId) || [];
-            const lastMembershipPaymentDate = accountPayments.reduce<Date | null>((latest, payment) => {
-                const paycat = String(payment.paycat || '').trim().toLowerCase();
-                if (paycat !== 'membership dues') {
-                    return latest;
-                }
-
-                const parsed = parseDate(payment.paymentDate);
-                if (!parsed) {
-                    return latest;
-                }
-                if (!latest || parsed > latest) {
-                    return parsed;
-                }
-                return latest;
-            }, null);
-            const lastPaymentKey = lastMembershipPaymentDate
-                ? lastMembershipPaymentDate.toISOString().slice(0, 10)
-                : null;
-            const isNotGoodStanding = amountDue >= threshold;
-
-            if (normalizedStatus === 'good') {
-                if (!(amountDue < threshold)) {
-                    continue;
-                }
-            } else if (!isNotGoodStanding) {
-                continue;
-            }
-
-            const account = accountMap.get(accountId);
-
-            items.push({
-                accountId,
-                memberName: account?.memberName ?? '-',
-                classification: account?.classification ?? null,
-                neighborhood: account?.neighborhood ?? '-',
-                block: account?.block ?? '-',
-                lot: account?.lot ?? '-',
-                amountDue,
-                lastPaymentDate: lastMembershipPaymentDate,
-            });
-        }
-
-        items.sort((a, b) => a.accountId.localeCompare(b.accountId, 'en', { numeric: true }));
-
-        return {
-            currentBillingLabel,
-            billingEndDateKey,
-            items,
-        };
+        return this.getAccountingMemberReport(status === 'good' ? 'settled' : 'not_good_standing');
     }
 }
